@@ -1,0 +1,5 @@
+/workspace/build/CMakeFiles/websocket_example.dir
+/workspace/build/CMakeFiles/websocket_test.dir
+/workspace/build/CMakeFiles/websocket_performance.dir
+/workspace/build/CMakeFiles/edit_cache.dir
+/workspace/build/CMakeFiles/rebuild_cache.dir
