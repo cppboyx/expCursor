@@ -37,6 +37,7 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/rand.h>
+#include <openssl/sha.h>
 
 #ifdef USE_ZLIB
 #include <zlib.h>
@@ -44,13 +45,13 @@
 
 namespace websocket {
 
-// 错误码定义
-enum class ErrorCode {
+// Result codes
+enum class ResultCode {
     SUCCESS = 0,
-    INVALID_URL,
-    CONNECTION_FAILED,
-    HANDSHAKE_FAILED,
-    INVALID_FRAME,
+    URL_ERROR,
+    CONNECTION_ERROR,
+    HANDSHAKE_ERROR,
+    FRAME_ERROR,
     COMPRESSION_ERROR,
     SSL_ERROR,
     TIMEOUT,
@@ -60,26 +61,28 @@ enum class ErrorCode {
     INVALID_PARAMETER
 };
 
-// 错误信息类
-class WebSocketError {
+class WebSocketResult {
 public:
-    WebSocketError(ErrorCode code, const std::string& message) 
+    WebSocketResult(ResultCode code, const std::string& message) 
         : code_(code), message_(message) {}
     
-    ErrorCode code() const { return code_; }
-    const std::string& message() const { return message_; }
-    
-    std::string toString() const {
-        return "WebSocket Error [" + std::to_string(static_cast<int>(code_)) + "]: " + message_;
-    }
+    WebSocketResult(const WebSocketResult&) = default;
+    WebSocketResult(WebSocketResult&&) = default;
+    WebSocketResult& operator=(const WebSocketResult&) = default;
+    WebSocketResult& operator=(WebSocketResult&&) = default;
+
+    explicit operator bool() const noexcept { return code_ == ResultCode::SUCCESS; }
+    explicit bool operator!() const noexcept { return code_ != ResultCode::SUCCESS; }
+
+    ResultCode code() const noexcept { return code_; }
+    const std::string& message() const noexcept { return message_; }
 
 private:
-    ErrorCode code_;
+    ResultCode code_;
     std::string message_;
 };
 
-// WebSocket帧类型
-enum class FrameType {
+enum class FrameType : uint8_t {
     CONTINUATION = 0x0,
     TEXT = 0x1,
     BINARY = 0x2,
@@ -88,7 +91,6 @@ enum class FrameType {
     PONG = 0xA
 };
 
-// WebSocket状态
 enum class WebSocketState {
     CONNECTING,
     OPEN,
@@ -96,11 +98,10 @@ enum class WebSocketState {
     CLOSED
 };
 
-// WebSocket配置类
+// Config
 class WebSocketConfig {
 public:
     WebSocketConfig() {
-        // 默认配置
         timeout_ms_ = 5000;
         max_frame_size_ = 1024 * 1024; // 1MB
         enable_compression_ = false;
@@ -248,18 +249,13 @@ public:
 // URL解析类
 class URL {
 public:
-    URL(const std::string& url) {
-        parse(url);
-    }
+    std::string scheme() const noexcept { return scheme_; }
+    std::string host() const noexcept { return host_; }
+    int port() const noexcept { return port_; }
+    std::string path() const noexcept { return path_; }
+    std::string query() const noexcept { return query_; }
 
-    std::string scheme() const { return scheme_; }
-    std::string host() const { return host_; }
-    int port() const { return port_; }
-    std::string path() const { return path_; }
-    std::string query() const { return query_; }
-
-private:
-    void parse(const std::string& url) {
+    WebSocketResult parse(const std::string& url) noexcept {
         size_t pos = 0;
         
         // 解析协议
@@ -267,6 +263,8 @@ private:
         if (scheme_end != std::string::npos) {
             scheme_ = url.substr(0, scheme_end);
             pos = scheme_end + 3;
+        } else {
+            return WebSocketResult(ResultCode::URL_ERROR,"Invalid URL: missing scheme");
         }
 
         // 解析主机和端口
@@ -280,9 +278,21 @@ private:
         if (colon_pos != std::string::npos) {
             host_ = host_port.substr(0, colon_pos);
             port_ = std::stoi(host_port.substr(colon_pos + 1));
+
+            if (std::to_string(port_) != host_port.substr(colon_pos + 1)) {
+                return WebSocketResult(ResultCode::URL_ERROR,"Invalid URL: invalid port number");
+            }
+
+            if (port_ <= 0 || port_ > 65535) {
+                return WebSocketResult(ResultCode::URL_ERROR,"Invalid URL: invalid port number");
+            }
         } else {
             host_ = host_port;
             port_ = (scheme_ == "wss") ? 443 : 80;
+        }
+
+        if (host_.empty()) {
+            return WebSocketResult(ResultCode::URL_ERROR,"Invalid URL: missing host");
         }
 
         // 解析路径和查询
@@ -298,8 +308,11 @@ private:
         }
 
         if (path_.empty()) path_ = "/";
+
+        return WebSocketResult(ResultCode::SUCCESS, "");
     }
 
+private:
     std::string scheme_;
     std::string host_;
     int port_;
@@ -307,79 +320,185 @@ private:
     std::string query_;
 };
 
+#ifndef _WIN32
+#define INVALID_SOCKET -1
+#define SOCKET_ERROR -1
+#endif
+
 // 网络连接类
 class NetworkConnection {
 public:
-    NetworkConnection() : socket_(-1), ssl_ctx_(nullptr), ssl_(nullptr) {
-#ifdef _WIN32
+    NetworkConnection() : socket_(INVALID_SOCKET), ssl_ctx_(nullptr), ssl_(nullptr) {
+        #ifdef _WIN32
         WSADATA wsaData;
         WSAStartup(MAKEWORD(2, 2), &wsaData);
-#endif
+        #endif
     }
 
     ~NetworkConnection() {
         close();
-#ifdef _WIN32
+
+        #ifdef _WIN32
         WSACleanup();
-#endif
+        #endif
     }
 
-    bool connect(const std::string& host, int port, bool use_ssl) {
+    WebSocketResult connect(const std::string& host, int port, bool use_ssl, int timeout_ms) noexcept {
         // 解析主机地址
         struct addrinfo hints, *result;
         memset(&hints, 0, sizeof(hints));
         hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
 
-        if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &result) != 0) {
-            return false;
+        int ret = getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &result);
+        if (ret != 0) {
+            #ifdef _WIN32
+            return WebSocketResult(ResultCode::CONNECTION_ERROR,"Failed to resolve host: " + std::string(WSAGetLastError()));
+            #else
+            return WebSocketResult(ResultCode::CONNECTION_ERROR,"Failed to resolve host: " + std::string(gai_strerror(ret)));
+            #endif
         }
 
-        // 创建socket
-        socket_ = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
-        if (socket_ == -1) {
-            freeaddrinfo(result);
-            return false;
-        }
-
-        // 连接
-        if (::connect(socket_, result->ai_addr, result->ai_addrlen) != 0) {
-            close();
-            freeaddrinfo(result);
-            return false;
+        WebSocketResult result(ResultCode::SUCCESS, "");
+        for (rp = result; rp != NULL; rp = rp->ai_next) {
+            result = connectInternal(rp);
+            if(!result) {
+                continue;
+            }
         }
 
         freeaddrinfo(result);
 
-        // 设置非阻塞模式
-        setNonBlocking(true);
-
-        if (use_ssl) {
-            return setupSSL(host);
+        if (result && use_ssl) {
+            result = setupSSL();
         }
 
-        return true;
+        if(!result) {
+            close();
+        }
+
+        return result;
     }
 
-    bool send(const std::string& data) {
+    WebSocketResult send(const std::string& data) noexcept {
         if (ssl_) {
-            return SSL_write(ssl_, data.c_str(), data.length()) > 0;
+            size_t written = 0;
+            while (SSL_write_ex(ssl_, data.c_str(), data.length(), &written) == 0) {
+                int error = SSL_get_error(ssl_, 0);
+                if(error == SSL_ERROR_WANT_READ) {
+                    fd_set fds;
+                    FD_ZERO(&fds);
+                    FD_SET(SSL_get_fd(ssl_), &fds);
+                    select(SSL_get_fd(ssl_) + 1, &fds, NULL, NULL, NULL);
+                    continue;
+                } else if(error == SSL_ERROR_WANT_WRITE) {
+                    fd_set fds;
+                    FD_ZERO(&fds);
+                    FD_SET(SSL_get_fd(ssl_), &fds);
+                    select(SSL_get_fd(ssl_) + 1, NULL, &fds, NULL, NULL);
+                    continue;
+                } else {
+                    return WebSocketResult(ResultCode::CONNECTION_ERROR,"Failed to send: " + std::string(ERR_reason_error_string(ERR_get_error())));
+                }
+            }
         } else {
-            return ::send(socket_, data.c_str(), data.length(), 0) > 0;
+            while(::send(socket_, data.c_str(), data.length(), 0) == SOCKET_ERROR) {
+                #ifdef _WIN32
+                if(WSAGetLastError() == WSAEWOULDBLOCK) {
+                    fd_set fds;
+                    FD_ZERO(&fds);
+                    FD_SET(socket_, &fds);
+                    select(socket_ + 1, NULL, &fds, NULL, NULL);
+                    continue;
+                }
+                #else
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    fd_set fds;
+                    FD_ZERO(&fds);
+                    FD_SET(socket_, &fds);
+                    select(socket_ + 1, NULL, &fds, NULL, NULL);
+                    continue;
+                }
+                #endif
+
+                #ifndef _WIN32
+                return WebSocketResult(ResultCode::CONNECTION_ERROR,"Failed to send: " + std::string(strerror(errno)));
+                #else
+                return WebSocketResult(ResultCode::CONNECTION_ERROR,"Failed to send: " + std::string(WSAGetLastError()));
+                #endif
+            }
         }
+
+        return WebSocketResult(ResultCode::SUCCESS, "");
     }
 
-    int receive(char* buffer, int size) {
+    WebSocketResult receive(char* buffer, int size, size& readbytes, int timeout_ms) noexcept {
+        timeval time_out = {0};
+        time_out.tv_sec = timeout_ms / 1000;
+        time_out.tv_usec = (timeout_ms % 1000) * 1000;
+            
         if (ssl_) {
-            return SSL_read(ssl_, buffer, size);
+            fd_set fds;
+            FD_ZERO(&fds);
+            FD_SET(SSL_get_fd(ssl_), &fds);
+            select(SSL_get_fd(ssl_) + 1, &fds, NULL, NULL, &time_out);
+        
+            readbytes = 0;
+            if (SSL_read_ex(ssl_, buffer, size, &readbytes) == 0) {
+                int error = SSL_get_error(ssl_, 0);
+                if(error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE) {
+                    return WebSocketResult(ResultCode::CONNECTION_ERROR,"Failed to recv: " + std::string(ERR_reason_error_string(ERR_get_error())));
+                }
+            }
+
+            return WebSocketResult(ResultCode::SUCCESS, "");
         } else {
-            return ::recv(socket_, buffer, size, 0);
+            fd_set fds;
+            FD_ZERO(&fds);
+            FD_SET(socket_, &fds);
+            select(socket_ + 1, &fds, NULL, NULL, &time_out);
+
+            int ret = ::recv(socket_, buffer, size, 0);
+            if(ret == 0) {
+                return WebSocketResult(ResultCode::CONNECTION_ERROR,"Connection closed by peer");
+            } else if(ret == SOCKET_ERROR) {
+                #ifdef _WIN32
+                if(WSAGetLastError() != WSAEWOULDBLOCK) {
+                    return WebSocketResult(ResultCode::CONNECTION_ERROR,"Failed to recv: " + std::string(WSAGetLastError()));
+                }
+                #else
+                if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    return WebSocketResult(ResultCode::CONNECTION_ERROR,"Failed to recv: " + std::string(strerror(errno)));
+                }
+                #endif
+            }
+
+            readbytes = ret;
+            return WebSocketResult(ResultCode::SUCCESS, "");
         }
     }
 
-    void close() {
+    void close() noexcept {
         if (ssl_) {
-            SSL_shutdown(ssl_);
+            while ((int ret = SSL_shutdown(ssl)) < 0) {
+                int error = SSL_get_error(ssl_, ret);
+                if(error == SSL_ERROR_WANT_READ) {
+                    fd_set fds;
+                    FD_ZERO(&fds);
+                    FD_SET(SSL_get_fd(ssl_), &fds);
+                    select(SSL_get_fd(ssl_) + 1, &fds, NULL, NULL, NULL);
+                    continue;
+                } else if(error == SSL_ERROR_WANT_WRITE) {
+                    fd_set fds;
+                    FD_ZERO(&fds);
+                    FD_SET(SSL_get_fd(ssl_), &fds);
+                    select(SSL_get_fd(ssl_) + 1, NULL, &fds, NULL, NULL);
+                    continue;
+                }
+
+                break;
+            }
+
             SSL_free(ssl_);
             ssl_ = nullptr;
         }
@@ -387,64 +506,166 @@ public:
             SSL_CTX_free(ssl_ctx_);
             ssl_ctx_ = nullptr;
         }
-        if (socket_ != -1) {
-#ifdef _WIN32
+        if (socket_ != INVALID_SOCKET) {
+            #ifdef _WIN32
             closesocket(socket_);
-#else
+            #else
             ::close(socket_);
-#endif
-            socket_ = -1;
+            #endif
+            
+            socket_ = INVALID_SOCKET;
         }
     }
 
-    bool isConnected() const {
-        return socket_ != -1;
+    bool isConnected() const noexcept {
+        return socket_ != INVALID_SOCKET;
     }
 
 private:
-    bool setupSSL(const std::string& host) {
+    WebSocketResult connectInternal(struct addrinfo* result, bool use_ssl, int timeout_ms) noexcept {
+        // 创建socket
+        socket_ = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+        if (socket_ == INVALID_SOCKET) {
+            #ifdef _WIN32
+            return WebSocketResult(ResultCode::CONNECTION_ERROR,"Failed to create socket: " + std::string(WSAGetLastError()));
+            #else
+            return WebSocketResult(ResultCode::CONNECTION_ERROR,"Failed to create socket: " + std::string(strerror(errno)));
+            #endif
+        }
+
+        // 设置非阻塞模式
+        #ifdef _WIN32
+        u_long mode = 1;
+        if (ioctlsocket(socket_, FIONBIO, &mode) == SOCKET_ERROR) {
+            return WebSocketResult(ResultCode::CONNECTION_ERROR,"Failed to set non-blocking mode: " + std::string(WSAGetLastError()));
+        }
+        #else
+        int flags = fcntl(socket_, F_GETFL, 0);
+        if (flags < 0) {
+            return WebSocketResult(ResultCode::CONNECTION_ERROR,"Failed to get socket flags: " + std::string(strerror(errno)));
+        }
+
+        if (fcntl(socket_, F_SETFL, flags | O_NONBLOCK) == -1) {
+            return WebSocketResult(ResultCode::CONNECTION_ERROR,"Failed to set non-blocking mode: " + std::string(strerror(errno)));
+        }
+        #endif
+
+        // 连接
+        ret = ::connect(socket_, result->ai_addr, result->ai_addrlen);
+        if (ret == SOCKET_ERROR) {
+             #ifdef _WIN32
+            if (WSAGetLastError() != WSAEWOULDBLOCK) {
+                return WebSocketResult(ResultCode::CONNECTION_ERROR,"Failed to connect: " + std::string(WSAGetLastError()));
+            }
+            #else
+            if (errno != EINPROGRESS) {
+                return WebSocketResult(ResultCode::CONNECTION_ERROR,"Failed to connect: " + std::string(strerror(errno)));
+            }
+            #endif
+
+            fd_set setw, sete;
+            FD_ZERO(&setw);
+            FD_SET(socket_, &setw);
+            FD_ZERO(&sete);
+            FD_SET(socket_, &sete);
+
+            timeval time_out = {0};
+            time_out.tv_sec = timeout_ms / 1000;
+            time_out.tv_usec = (timeout_ms % 1000) * 1000;
+            
+            ret = select(socket_ + 1, NULL, &setw, &sete, &time_out);
+            if (ret < 0) {
+                #ifdef _WIN32
+                return WebSocketResult(ResultCode::CONNECTION_ERROR,"Failed to connect: " + std::string(WSAGetLastError()));
+                #else
+                return WebSocketResult(ResultCode::CONNECTION_ERROR,"Failed to connect: " + std::string(strerror(errno)));
+                #endif
+            } else if(ret == 0) {
+                //time out
+                return WebSocketResult(ResultCode::CONNECTION_ERROR,"Failed to connect: timeout");
+            } else {
+                if (FD_ISSET(socket_, &sete)) {
+                    int so_error;
+                    socklen_t len = sizeof(so_error);
+                    ret = getsockopt(socket_, SOL_SOCKET, SO_ERROR, &so_error, &len);
+                    if(ret == SOCKET_ERROR) {
+                        #ifdef _WIN32
+                        return WebSocketResult(ResultCode::CONNECTION_ERROR,"Failed to connect: " + std::string(WSAGetLastError()));
+                        #else
+                        return WebSocketResult(ResultCode::CONNECTION_ERROR,"Failed to connect: " + std::string(strerror(errno)));
+                        #endif
+                    }
+                    
+                    #ifdef _WIN32
+                    WSASetLastError(so_error);
+                    return WebSocketResult(ResultCode::CONNECTION_ERROR,"Failed to connect: " + std::string(WSAGetLastError()));
+                    #else
+                    errno = so_error;
+                    return WebSocketResult(ResultCode::CONNECTION_ERROR,"Failed to connect: " + std::string(strerror(errno)));
+                    #endif
+                }
+            }
+        }
+
+        return WebSocketResult(ResultCode::SUCCESS, "");
+    }
+
+    WebSocketResult setupSSL() noexcept {
         SSL_library_init();
         SSL_load_error_strings();
         OpenSSL_add_all_algorithms();
 
         ssl_ctx_ = SSL_CTX_new(TLS_client_method());
         if (!ssl_ctx_) {
-            return false;
+            return WebSocketResult(ResultCode::CONNECTION_ERROR,"Failed to create SSL context: " + std::string(ERR_reason_error_string(ERR_get_error())));
         }
 
         ssl_ = SSL_new(ssl_ctx_);
         if (!ssl_) {
-            return false;
+            return WebSocketResult(ResultCode::CONNECTION_ERROR,"Failed to create SSL: " + std::string(ERR_reason_error_string(ERR_get_error())));
         }
 
-        SSL_set_fd(ssl_, socket_);
-        SSL_set_tlsext_host_name(ssl_, host.c_str());
-
-        if (SSL_connect(ssl_) != 1) {
-            return false;
+        if (SSL_set_fd(ssl_, socket_) != 1) {
+            return WebSocketResult(ResultCode::CONNECTION_ERROR,"Failed to set SSL socket: " + std::string(ERR_reason_error_string(ERR_get_error())));
         }
 
-        return true;
+        if (SSL_set_tlsext_host_name(ssl_, host.c_str()) != 1) {
+            return WebSocketResult(ResultCode::CONNECTION_ERROR,"Failed to set SSL host name: " + std::string(ERR_reason_error_string(ERR_get_error())));
+        }
+
+        while(SSL_connect(ssl_) <= 0) {
+            ret = SSL_get_error(ssl_,ret);
+            if(ret == SSL_ERROR_WANT_READ) {
+                fd_set fds;
+                FD_ZERO(&fds);
+                FD_SET(SSL_get_fd(ssl_), &fds);
+                select(SSL_get_fd(ssl_) + 1, &fds, NULL, NULL, NULL);
+                continue;
+            } else if(ret == SSL_ERROR_WANT_WRITE) {
+                fd_set fds;
+                FD_ZERO(&fds);
+                FD_SET(SSL_get_fd(ssl_), &fds);
+                select(SSL_get_fd(ssl_) + 1, NULL, &fds, NULL, NULL);
+                continue;
+            } else {
+                return WebSocketResult(ResultCode::CONNECTION_ERROR,"Failed to connect SSL: " + std::string(ERR_reason_error_string(ERR_get_error())));
+            }
+        }
+
+        return WebSocketResult(ResultCode::SUCCESS, "");
     }
 
-    void setNonBlocking(bool nonblocking) {
-#ifdef _WIN32
-        u_long mode = nonblocking ? 1 : 0;
-        ioctlsocket(socket_, FIONBIO, &mode);
-#else
-        int flags = fcntl(socket_, F_GETFL, 0);
-        if (nonblocking) {
-            fcntl(socket_, F_SETFL, flags | O_NONBLOCK);
-        } else {
-            fcntl(socket_, F_SETFL, flags & ~O_NONBLOCK);
-        }
-#endif
-    }
-
+private:
     int socket_;
     SSL_CTX* ssl_ctx_;
     SSL* ssl_;
 };
+
+#ifndef _WIN32
+#undef INVALID_SOCKET
+#undef SOCKET_ERROR
+#endif
+
 
 #ifdef USE_ZLIB
 // 压缩/解压类
@@ -460,10 +681,13 @@ public:
         inflateEnd(&decompressor_);
     }
 
-    std::string compress(const std::string& data) {
-        if (data.empty()) return data;
+    WebSocketResult compress(const std::string& data,std::string& result) noexcept {
+        if (data.empty()) {
+            result = data;
+            return WebSocketResult(ResultCode::SUCCESS, "");
+        }
 
-        std::string result;
+        result.clear();
         compressor_.next_in = const_cast<Bytef*>(reinterpret_cast<const Bytef*>(data.c_str()));
         compressor_.avail_in = data.length();
 
@@ -473,21 +697,26 @@ public:
             compressor_.avail_out = sizeof(buffer);
 
             int ret = deflate(&compressor_, Z_SYNC_FLUSH);
-            if (ret == Z_STREAM_ERROR) {
-                return "";
+            if(ret == Z_STREAM_END) {
+                break;
+            } else if(ret != Z_OK) {
+                return WebSocketResult(ResultCode::COMPRESSION_ERROR,"Failed to compress: " + std::string(zlibError(ret)));
             }
 
             size_t compressed_size = sizeof(buffer) - compressor_.avail_out;
             result.append(buffer, compressed_size);
         } while (compressor_.avail_out == 0);
 
-        return result;
+        return WebSocketResult(ResultCode::SUCCESS, "");
     }
 
-    std::string decompress(const std::string& data) {
-        if (data.empty()) return data;
+    WebSocketResult decompress(const std::string& data,std::string& result)  noexcept {
+        if (data.empty()) {
+            result = data;
+            return WebSocketResult(ResultCode::SUCCESS, "");
+        }
 
-        std::string result;
+        result.clear();
         decompressor_.next_in = const_cast<Bytef*>(reinterpret_cast<const Bytef*>(data.c_str()));
         decompressor_.avail_in = data.length();
 
@@ -497,15 +726,17 @@ public:
             decompressor_.avail_out = sizeof(buffer);
 
             int ret = inflate(&decompressor_, Z_SYNC_FLUSH);
-            if (ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR) {
-                return "";
+            if(ret == Z_STREAM_END) {
+                break;
+            } else if(ret != Z_OK) {
+                return WebSocketResult(ResultCode::COMPRESSION_ERROR,"Failed to decompress: " + std::string(zlibError(ret)));
             }
 
             size_t decompressed_size = sizeof(buffer) - decompressor_.avail_out;
             result.append(buffer, decompressed_size);
         } while (decompressor_.avail_out == 0);
 
-        return result;
+        return WebSocketResult(ResultCode::SUCCESS, "");
     }
 
 private:
@@ -592,12 +823,11 @@ public:
         return frame;
     }
 
-    static WebSocketFrame parse(const std::string& data) {
-        WebSocketFrame frame;
+    static WebSocketResult parse(const std::string& data,WebSocketFrame& frame) noexcept {
         size_t pos = 0;
 
         if (data.length() < 2) {
-            throw WebSocketError(ErrorCode::INVALID_FRAME, "Frame too short");
+            return WebSocketResult(ResultCode::FRAME_ERROR, "Frame too short");
         }
 
         // 解析第一个字节
@@ -612,13 +842,13 @@ public:
 
         if (payload_length == 126) {
             if (data.length() < pos + 2) {
-                throw WebSocketError(ErrorCode::INVALID_FRAME, "Frame too short for 16-bit length");
+                return WebSocketResult(ResultCode::FRAME_ERROR, "Frame too short for 16-bit length");
             }
             payload_length = (static_cast<uint8_t>(data[pos]) << 8) | static_cast<uint8_t>(data[pos + 1]);
             pos += 2;
         } else if (payload_length == 127) {
             if (data.length() < pos + 8) {
-                throw WebSocketError(ErrorCode::INVALID_FRAME, "Frame too short for 64-bit length");
+                return WebSocketResult(ResultCode::FRAME_ERROR, "Frame too short for 64-bit length");
             }
             payload_length = 0;
             for (int i = 0; i < 8; ++i) {
@@ -630,7 +860,7 @@ public:
         // 解析掩码密钥
         if (frame.masked_) {
             if (data.length() < pos + 4) {
-                throw WebSocketError(ErrorCode::INVALID_FRAME, "Frame too short for mask key");
+                return WebSocketResult(ResultCode::FRAME_ERROR, "Frame too short for mask key");
             }
             frame.mask_key_ = data.substr(pos, 4);
             pos += 4;
@@ -638,7 +868,7 @@ public:
 
         // 解析载荷数据
         if (data.length() < pos + payload_length) {
-            throw WebSocketError(ErrorCode::INVALID_FRAME, "Frame too short for payload");
+            return WebSocketResult(ResultCode::FRAME_ERROR, "Frame too short for payload");
         }
 
         std::string payload = data.substr(pos, payload_length);
@@ -651,7 +881,7 @@ public:
         frame.payload_ = payload;
         frame.payload_length_ = payload.length();
 
-        return frame;
+        return WebSocketResult(ResultCode::SUCCESS, "");
     }
 
 private:
@@ -666,11 +896,12 @@ private:
 // WebSocket握手类
 class WebSocketHandshake {
 public:
-    static std::string createHandshakeRequest(const URL& url, const WebSocketConfig& config) {
+    static WebSocketResult createHandshakeRequest(const URL& url, const WebSocketConfig& config, std::string& request, std::string& accept_key) noexcept {
         std::string key = Utils::generateRandomString(16);
-        std::string accept_key = Utils::base64Encode(Utils::sha1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"));
+        accept_key = Utils::base64Encode(Utils::sha1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"));
 
-        std::string request = "GET " + url.path();
+        request.clear();
+        request = "GET " + url.path();
         if (!url.query().empty()) {
             request += "?" + url.query();
         }
@@ -704,17 +935,19 @@ public:
         }
 
         request += "\r\n";
-        return request;
+        return WebSocketResult(ResultCode::SUCCESS, "");
     }
 
-    static bool parseHandshakeResponse(const std::string& response) {
+    static WebSocketResult parseHandshakeResponse(const std::string& response, const std::string& accept_key) noexcept {
         std::vector<std::string> lines = Utils::split(response, '\n');
-        if (lines.empty()) return false;
+        if (lines.empty()) {
+            return WebSocketResult(ResultCode::HANDSHAKE_ERROR, "Empty response");
+        }
 
         // 检查状态行
         std::string status_line = Utils::trim(lines[0]);
         if (status_line.find("HTTP/1.1 101") == std::string::npos) {
-            return false;
+            return WebSocketResult(ResultCode::HANDSHAKE_ERROR, "Invalid status line : " + status_line);
         }
 
         // 检查必需的头部
@@ -734,28 +967,110 @@ public:
             } else if (key == "connection" && Utils::toLower(value).find("upgrade") != std::string::npos) {
                 has_connection = true;
             } else if (key == "sec-websocket-accept") {
+                if (value != accept_key) {
+                    return WebSocketResult(ResultCode::HANDSHAKE_ERROR, "Invalid accept key : " + value);
+                }
+
                 has_accept = true;
             }
         }
 
-        return has_upgrade && has_connection && has_accept;
+        if (!has_upgrade) {
+            return WebSocketResult(ResultCode::HANDSHAKE_ERROR, "Missing upgrade header");
+        }
+        if (!has_connection) {
+            return WebSocketResult(ResultCode::HANDSHAKE_ERROR, "Missing connection header");
+        }
+        if (!has_accept) {
+            return WebSocketResult(ResultCode::HANDSHAKE_ERROR, "Missing accept header");
+        }
+
+        return WebSocketResult(ResultCode::SUCCESS, "");
     }
 };
 
-// 消息回调类型定义
-using MessageCallback = std::function<void(const std::string&)>;
-using ErrorCallback = std::function<void(const WebSocketError&)>;
-using StateChangeCallback = std::function<void(WebSocketState)>;
+
+class TaskRunner {
+public:
+    TaskRunner() : run_(false) {}
+    ~TaskRunner() {
+        stop();
+    }
+
+    void start () noexcept {
+        std::unique_lock<std::mutex> lock(mtx_);
+        if (run_) {
+            return;
+        }
+
+        run_ = true;
+        worker_ = std::thread([this] { run(); });
+    }
+
+    void stop() noexcept {
+        {
+            std::unique_lock<std::mutex> lock(mtx_);
+            if (!run_) {
+                return;
+            }
+
+            run_ = false;
+        }
+
+        cv_.notify_all();
+        worker_.join();
+    }
+
+    void push_task(std::function<void()> task) {
+        {
+            std::unique_lock<std::mutex> lock(mtx_);
+            tasks_.push(std::move(task));
+        }
+        cv_.notify_one();
+    }
+
+    void clear() {
+        {
+            std::unique_lock<std::mutex> lock(mtx_);
+            tasks_.clear();
+        }
+        cv_.notify_all();
+    }
+
+private:
+    void run() {
+        while (true) {
+            std::function<void()> task;
+            {
+                std::unique_lock<std::mutex> lock(mtx_);
+                cv_.wait(lock, [this] { return !run_ || !tasks_.empty(); });
+
+                if (!run_ && tasks_.empty()) {
+                    return;
+                }
+
+                task = std::move(tasks_.front());
+                tasks_.pop();
+            }
+            task();
+        }
+    }
+
+    std::thread worker_;
+    std::mutex mtx_;
+    std::condition_variable cv_;
+    std::queue<std::function<void()>> tasks_;
+    bool run_;
+};
+
 
 // WebSocket客户端主类
 class WebSocketClient {
 public:
     WebSocketClient() : state_(WebSocketState::CLOSED), config_(WebSocketConfig()) {
-        initCallbacks();
     }
 
     explicit WebSocketClient(const WebSocketConfig& config) : state_(WebSocketState::CLOSED), config_(config) {
-        initCallbacks();
     }
 
     ~WebSocketClient() {
@@ -763,63 +1078,96 @@ public:
     }
 
     // 设置回调函数
-    void setMessageCallback(MessageCallback callback) { message_callback_ = callback; }
-    void setErrorCallback(ErrorCallback callback) { error_callback_ = callback; }
-    void setStateChangeCallback(StateChangeCallback callback) { state_change_callback_ = callback; }
+    void setOnMsgText(std::function<void(const std::string&)> callback) { text_message_callback_ = callback; }
+    void setOnMsgBinary(std::function<void(const std::vector<uint8_t>&)> callback) { binary_message_callback_ = callback; }
+    void setOnError(std::function<void(const std::string& reason)> callback) { error_callback_ = callback; }
+    void setOnOpen(std::function<void()> callback) { open_callback_ = callback; }
+    void setOnClose(std::function<void(const std::string& reason)> callback) { close_callback_ = callback; }
+
+
 
     // 连接方法
-    bool connect(const std::string& url) {
-        try {
-            URL parsed_url(url);
-            return connectInternal(parsed_url);
-        } catch (const std::exception& e) {
-            handleError(ErrorCode::INVALID_URL, "Invalid URL: " + std::string(e.what()));
-            return false;
+    WebSocketResult connect_sync(const std::string& url) noexcept {
+        WebSocketState state = WebSocketState::CLOSED;
+        if (_state.compare_exchange_strong(state, WebSocketState::CONNECTING)) {
+            return WebSocketResult(ResultCode::INVALID_STATE, "WebSocket is already connecting");
         }
+
+        URL u;
+        if (auto res = u.parse(url); !res) {
+            _state = WebSocketState::CLOSED;
+            return res;
+        }
+
+        // 连接网络
+        if (auto res = connection_.connect(url.host(), url.port(), (url.scheme() == "wss")); !res) {
+            _state = WebSocketState::CLOSED;
+            return res;
+        }
+
+        // 执行握手
+        if (auto res = performHandshake(url); !res) {
+            connection_.close();
+
+            _state = WebSocketState::CLOSED;
+            return res;
+        }
+
+        // 启动工作线程
+        startWorker();
+
+        _state = WebSocketState::OPEN;
+        onOpen();
+
+        return WebSocketResult(ResultCode::SUCCESS, "");
+    }
+
+    void connect_async(const std::string& url, const std::function<void(WebSocketResult)>& callback) noexcept {
+        task_runner_.start();
+        task_runner_.push_task([this, url, callback] {
+             callback(connect_sync(url));
+        });
     }
 
     // 断开连接
     void disconnect() {
-        if (state_ == WebSocketState::CLOSED) return;
+        if (state_ == WebSocketState::OPEN) {
+            setState(WebSocketState::CLOSING);
+            
+            // 发送关闭帧
+            sendCloseFrame();
+        }
 
-        setState(WebSocketState::CLOSING);
-        
-        // 发送关闭帧
-        sendCloseFrame();
-        
         // 停止工作线程
         stopWorker();
+
+        setState(WebSocketState::CLOSED);
         
         // 关闭网络连接
         connection_.close();
-        
-        setState(WebSocketState::CLOSED);
     }
 
     // 发送消息
-    bool send(const std::string& message) {
+    WebSocketResult send(const std::string& message) {
         if (state_ != WebSocketState::OPEN) {
-            handleError(ErrorCode::INVALID_STATE, "WebSocket is not open");
-            return false;
+            return WebSocketResult(ResultCode::INVALID_STATE, "WebSocket is not open");
         }
 
         return sendFrame(FrameType::TEXT, message);
     }
 
-    bool sendBinary(const std::string& data) {
+    WebSocketResult sendBinary(const std::string& data) {
         if (state_ != WebSocketState::OPEN) {
-            handleError(ErrorCode::INVALID_STATE, "WebSocket is not open");
-            return false;
+            return WebSocketResult(ResultCode::INVALID_STATE, "WebSocket is not open");
         }
 
         return sendFrame(FrameType::BINARY, data);
     }
 
     // 发送ping
-    bool ping(const std::string& data = "") {
+    WebSocketResult ping(const std::string& data = "") {
         if (state_ != WebSocketState::OPEN) {
-            handleError(ErrorCode::INVALID_STATE, "WebSocket is not open");
-            return false;
+            return WebSocketResult(ResultCode::INVALID_STATE, "WebSocket is not open");
         }
 
         return sendFrame(FrameType::PING, data);
@@ -835,42 +1183,13 @@ public:
     }
 
 private:
-    void initCallbacks() {
-        message_callback_ = [](const std::string&) {};
-        error_callback_ = [](const WebSocketError&) {};
-        state_change_callback_ = [](WebSocketState) {};
-    }
 
-    bool connectInternal(const URL& url) {
-        setState(WebSocketState::CONNECTING);
-
-        // 连接网络
-        bool use_ssl = (url.scheme() == "wss");
-        if (!connection_.connect(url.host(), url.port(), use_ssl)) {
-            handleError(ErrorCode::CONNECTION_FAILED, "Failed to connect to " + url.host() + ":" + std::to_string(url.port()));
-            return false;
-        }
-
-        // 执行握手
-        if (!performHandshake(url)) {
-            connection_.close();
-            handleError(ErrorCode::HANDSHAKE_FAILED, "WebSocket handshake failed");
-            return false;
-        }
-
-        setState(WebSocketState::OPEN);
-
-        // 启动工作线程
-        startWorker();
-
-        return true;
-    }
-
-    bool performHandshake(const URL& url) {
+    WebSocketResult performHandshake(const URL& url) noexcept {
         // 发送握手请求
-        std::string request = WebSocketHandshake::createHandshakeRequest(url, config_);
-        if (!connection_.send(request)) {
-            return false;
+        std::string accept_key;
+        std::string request = WebSocketHandshake::createHandshakeRequest(url, config_, accept_key);
+        if (auto res = connection_.send(request); !res) {
+            return res;
         }
 
         // 接收握手响应
@@ -886,47 +1205,26 @@ private:
         }
 
         if (response.empty()) {
-            return false;
+            return WebSocketResult(ResultCode::HANDSHAKE_ERROR, "Empty handshake response");
         }
 
         // 解析响应
-        return WebSocketHandshake::parseHandshakeResponse(response);
+        return WebSocketHandshake::parseHandshakeResponse(response, accept_key);
     }
 
     void startWorker() {
-        worker_thread_ = std::thread([this]() {
-            while (state_ == WebSocketState::OPEN) {
-                try {
-                    if (!receiveFrame()) {
-                        break;
-                    }
-                } catch (const WebSocketError& e) {
-                    handleError(e.code(), e.message());
-                    break;
-                }
-            }
-        });
+        _runner.start();
 
-        // 启动ping线程
-        if (config_.getPingInterval() > 0) {
-            ping_thread_ = std::thread([this]() {
-                while (state_ == WebSocketState::OPEN) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(config_.getPingInterval()));
-                    if (state_ == WebSocketState::OPEN) {
-                        ping();
-                    }
-                }
-            });
-        }
+        //do for recv
+        //... 
+
+        //do for ping
+        //...
+
     }
 
     void stopWorker() {
-        if (worker_thread_.joinable()) {
-            worker_thread_.join();
-        }
-        if (ping_thread_.joinable()) {
-            ping_thread_.join();
-        }
+        _runner.stop();
     }
 
     bool receiveFrame() {
@@ -991,11 +1289,11 @@ private:
             case FrameType::BINARY: {
                 std::string payload = frame.getPayload();
                 
-#ifdef USE_ZLIB
+                #ifdef USE_ZLIB
                 if (config_.isCompressionEnabled() && !payload.empty()) {
                     payload = compression_.decompress(payload);
                 }
-#endif
+                #endif
                 
                 message_callback_(payload);
                 break;
@@ -1022,12 +1320,12 @@ private:
     bool sendFrame(FrameType type, const std::string& payload) {
         std::string data_to_send = payload;
         
-#ifdef USE_ZLIB
+        #ifdef USE_ZLIB
         if (config_.isCompressionEnabled() && !payload.empty() && 
             (type == FrameType::TEXT || type == FrameType::BINARY)) {
             data_to_send = compression_.compress(payload);
         }
-#endif
+        #endif
         
         WebSocketFrame frame;
         frame.setFin(true);
@@ -1052,32 +1350,47 @@ private:
         connection_.send(frame_data);
     }
 
-    void setState(WebSocketState state) {
-        if (state_ != state) {
-            state_ = state;
-            state_change_callback_(state);
+    void onError(const WebSocketResult& result) {
+        if (error_callback_) {
+            error_callback_(result);
         }
     }
 
-    void handleError(ErrorCode code, const std::string& message) {
-        WebSocketError error(code, message);
-        error_callback_(error);
+    void onOpen() {
+        if (open_callback_) {
+            open_callback_();
+        }
     }
 
-    WebSocketState state_;
+    void onClose() {
+        if (close_callback_) {
+            close_callback_();
+        }
+    }
+
+    void onTextMessage(const std::string& message) {
+        if (text_message_callback_) {
+            text_message_callback_(message);
+        }
+    }
+
+    void onBinaryMessage(const std::vector<uint8_t>& message) {
+        if (binary_message_callback_) {
+            binary_message_callback_(message);
+        }
+    }
+
+
+
+    std::atomic<WebSocketState> state_;
     WebSocketConfig config_;
     NetworkConnection connection_;
     
-#ifdef USE_ZLIB
+    #ifdef USE_ZLIB
     Compression compression_;
-#endif
+    #endif
     
-    std::thread worker_thread_;
-    std::thread ping_thread_;
-    
-    MessageCallback message_callback_;
-    ErrorCallback error_callback_;
-    StateChangeCallback state_change_callback_;
+    TaskRunner runner_;
 };
 
 } // namespace websocket
