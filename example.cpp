@@ -4,7 +4,7 @@
 #include <thread>
 
 int main() {
-    // 创建WebSocket配置
+    // Build WebSocket config
     websocket::WebSocketConfig config;
     config.setTimeout(5000);
     config.enableCompression(true);
@@ -13,67 +13,49 @@ int main() {
     config.addHeader("User-Agent", "WebSocket-Client/1.0");
     config.addExtension("permessage-deflate", "client_max_window_bits=15");
 
-    // 创建WebSocket客户端
+    // Create client
     websocket::WebSocketClient client(config);
 
-    // 设置消息回调
-    client.setMessageCallback([](const std::string& message) {
-        std::cout << "Received message: " << message << std::endl;
+    // Callbacks
+    client.setOnText([](const std::string &message) {
+        std::cout << "Received text: " << message << std::endl;
+    });
+    client.setOnError([](const websocket::WebSocketResult &err) {
+        std::cout << "Error: (" << static_cast<int>(err.code()) << ") " << err.message() << std::endl;
+    });
+    client.setOnOpen([]() {
+        std::cout << "State: OPEN" << std::endl;
+    });
+    client.setOnClose([]() {
+        std::cout << "State: CLOSED" << std::endl;
     });
 
-    // 设置错误回调
-    client.setErrorCallback([](const websocket::WebSocketError& error) {
-        std::cout << "Error: " << error.toString() << std::endl;
-    });
-
-    // 设置状态变化回调
-    client.setStateChangeCallback([](websocket::WebSocketState state) {
-        std::string state_str;
-        switch (state) {
-            case websocket::WebSocketState::CONNECTING:
-                state_str = "CONNECTING";
-                break;
-            case websocket::WebSocketState::OPEN:
-                state_str = "OPEN";
-                break;
-            case websocket::WebSocketState::CLOSING:
-                state_str = "CLOSING";
-                break;
-            case websocket::WebSocketState::CLOSED:
-                state_str = "CLOSED";
-                break;
-        }
-        std::cout << "State changed to: " << state_str << std::endl;
-    });
-
-    // 连接到WebSocket服务器
+    // Connect to WebSocket server (public echo)
     std::cout << "Connecting to WebSocket server..." << std::endl;
-    
-    // 使用一个公共的WebSocket echo服务器进行测试
     if (client.connect("wss://echo.websocket.org")) {
         std::cout << "Connected successfully!" << std::endl;
 
-        // 发送文本消息
+        // Send text
         std::string message = "Hello, WebSocket!";
         if (client.send(message)) {
             std::cout << "Sent message: " << message << std::endl;
         }
 
-        // 发送二进制数据
+        // Send binary
         std::string binary_data = "Binary data test";
         if (client.sendBinary(binary_data)) {
             std::cout << "Sent binary data" << std::endl;
         }
 
-        // 发送ping
+        // Ping
         if (client.ping("ping test")) {
             std::cout << "Sent ping" << std::endl;
         }
 
-        // 等待一段时间接收响应
+        // Wait for responses
         std::this_thread::sleep_for(std::chrono::seconds(5));
 
-        // 断开连接
+        // Disconnect
         std::cout << "Disconnecting..." << std::endl;
         client.disconnect();
     } else {
